@@ -1,0 +1,12 @@
+{
+  "tasks": {
+    "build:web": "npm run build",
+    "start:deno": "deno run --allow-net --allow-read --allow-env deno-deploy-app.mjs",
+    "check:deno": "deno check deno-deploy-app.mjs"
+  },
+  "deploy": {
+    "org": "yuhui4756",
+    "app": "gpt-image-2-mobile-deno"
+  }
+}
+

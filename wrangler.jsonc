@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gpt-image-2-mobile",
+  "main": "./proxy/cloudflare-worker.js",
+  "compatibility_date": "2026-04-29",
+  "workers_dev": true,
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  "vars": {
+    "UPSTREAM_BASE_URL": "https://mx.free.codesonline.dev",
+    "UPSTREAM_MODEL": "gpt-image-2",
+    "UPSTREAM_GENERATION_ENDPOINT": "/v1/images/generations",
+    "UPSTREAM_EDIT_ENDPOINT": "/v1/images/edits",
+    "UPSTREAM_MODELS_ENDPOINT": "/v1/models",
+    "UPSTREAM_RESPONSE_FORMAT": "b64_json",
+    "UPSTREAM_QUALITY": "high",
+    "UPSTREAM_BACKGROUND": "auto",
+    "PROXY_BASE_PATH": "/api/openai",
+    "ALLOW_CLIENT_AUTH": "false"
+  }
+}

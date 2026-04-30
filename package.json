@@ -1,0 +1,18 @@
+{
+  "name": "gpt-image-2-mobile-pwa",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "serve:local": "node server/local-app-server.mjs",
+    "local": "npm run build && npm run serve:local",
+    "cf:dev": "npm run build && npx wrangler dev",
+    "cf:deploy": "npm run build && npx wrangler deploy"
+  },
+  "devDependencies": {
+    "vite": "^7.1.0"
+  }
+}

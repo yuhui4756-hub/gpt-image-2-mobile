@@ -1,0 +1,21 @@
+{
+  "name": "GPT-image-2.0",
+  "short_name": "GPT-image-2.0",
+  "description": "为手机重新设计的旗舰级图像生成工作台。",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#060816",
+  "theme_color": "#060816",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "/apple-touch-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
