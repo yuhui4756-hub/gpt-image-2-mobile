@@ -75,6 +75,19 @@ function hasFileExtension(pathname) {
   return /\.[a-z0-9]{2,8}$/i.test(pathname)
 }
 
+async function readRequestBody(request) {
+  if (request.method === 'GET' || request.method === 'HEAD') {
+    return undefined
+  }
+
+  const contentType = request.headers.get('content-type') || ''
+  if (contentType.includes('application/json') || contentType.startsWith('text/')) {
+    return await request.text()
+  }
+
+  return new Uint8Array(await request.arrayBuffer())
+}
+
 async function proxyUpstream(request, env, requestUrl) {
   const upstreamBaseUrl = (env.UPSTREAM_BASE_URL || DEFAULTS.upstreamBaseUrl).replace(/\/+$/, '')
   const upstreamPath = requestUrl.pathname.slice(getProxyBasePath(env).length) + requestUrl.search
@@ -85,6 +98,7 @@ async function proxyUpstream(request, env, requestUrl) {
   if (contentType) {
     headers.set('Content-Type', contentType)
   }
+  headers.set('Accept', 'application/json, */*')
 
   const clientAuth = request.headers.get('Authorization')
   if (env.ALLOW_CLIENT_AUTH === 'true' && clientAuth) {
@@ -93,10 +107,21 @@ async function proxyUpstream(request, env, requestUrl) {
     headers.set('Authorization', `Bearer ${env.UPSTREAM_API_KEY}`)
   }
 
+  let requestBody
+  try {
+    requestBody = await readRequestBody(request)
+  } catch (error) {
+    return json(
+      { error: { message: `Failed to read request body: ${error.message || String(error)}` } },
+      400,
+      request,
+    )
+  }
+
   const init = {
     method: request.method,
     headers,
-    body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
+    body: requestBody,
   }
 
   let response

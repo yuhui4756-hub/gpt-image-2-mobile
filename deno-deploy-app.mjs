@@ -77,8 +77,7 @@ function hasFileExtension(pathname) {
 
 async function tryReadFile(fileUrl) {
   try {
-    const file = await Deno.readFile(fileUrl)
-    return file
+    return await Deno.readFile(fileUrl)
   } catch {
     return null
   }
@@ -145,7 +144,7 @@ function rewriteImageUrls(item, request, config) {
 async function proxyRemoteImage(requestUrl, request) {
   const targetUrl = requestUrl.searchParams.get('url')
   if (!targetUrl) {
-    return json({ error: { message: '缺少远程图片地址。' } }, 400, request)
+    return json({ error: { message: 'Missing remote image URL.' } }, 400, request)
   }
 
   try {
@@ -158,13 +157,26 @@ async function proxyRemoteImage(requestUrl, request) {
       headers,
     })
   } catch (error) {
-    return json({ error: { message: `远程图片读取失败：${error.message || String(error)}` } }, 502, request)
+    return json({ error: { message: `Remote image fetch failed: ${error.message || String(error)}` } }, 502, request)
   }
+}
+
+async function readRequestBody(request) {
+  if (request.method === 'GET' || request.method === 'HEAD') {
+    return undefined
+  }
+
+  const contentType = request.headers.get('content-type') || ''
+  if (contentType.includes('application/json') || contentType.startsWith('text/')) {
+    return await request.text()
+  }
+
+  return new Uint8Array(await request.arrayBuffer())
 }
 
 async function proxyUpstream(request, requestUrl, config) {
   if (!config.upstreamApiKey) {
-    return json({ error: { message: '服务端尚未配置 UPSTREAM_API_KEY。' } }, 500, request)
+    return json({ error: { message: 'Missing UPSTREAM_API_KEY.' } }, 500, request)
   }
 
   const upstreamBaseUrl = trimTrailingSlash(config.upstreamBaseUrl)
@@ -176,17 +188,25 @@ async function proxyUpstream(request, requestUrl, config) {
   if (contentType) {
     headers.set('Content-Type', contentType)
   }
+  headers.set('Accept', 'application/json, */*')
   headers.set('Authorization', `Bearer ${config.upstreamApiKey}`)
+
+  let requestBody
+  try {
+    requestBody = await readRequestBody(request)
+  } catch (error) {
+    return json({ error: { message: `Failed to read request body: ${error.message || String(error)}` } }, 400, request)
+  }
 
   let upstreamResponse
   try {
     upstreamResponse = await fetch(upstreamUrl, {
       method: request.method,
       headers,
-      body: request.method === 'GET' || request.method === 'HEAD' ? undefined : request.body,
+      body: requestBody,
     })
   } catch (error) {
-    return json({ error: { message: `代理请求上游失败：${error.message || String(error)}` } }, 502, request)
+    return json({ error: { message: `Upstream proxy request failed: ${error.message || String(error)}` } }, 502, request)
   }
 
   const contentTypeHeader = upstreamResponse.headers.get('content-type') || ''
@@ -195,7 +215,7 @@ async function proxyUpstream(request, requestUrl, config) {
     try {
       payload = await upstreamResponse.json()
     } catch {
-      return json({ error: { message: '上游返回了无法解析的 JSON。' } }, 502, request)
+      return json({ error: { message: 'Upstream returned invalid JSON.' } }, 502, request)
     }
 
     if (Array.isArray(payload?.data)) {
@@ -215,26 +235,33 @@ async function proxyUpstream(request, requestUrl, config) {
 }
 
 Deno.serve(async (request) => {
-  const requestUrl = new URL(request.url)
-  const config = getConfig()
+  try {
+    const requestUrl = new URL(request.url)
+    const config = getConfig()
 
-  if (request.method === 'OPTIONS' && (requestUrl.pathname === '/api/app-config' || requestUrl.pathname.startsWith(`${config.proxyBasePath}/`))) {
-    const headers = new Headers()
-    applyCorsHeaders(headers, request)
-    return new Response(null, { status: 204, headers })
+    if (
+      request.method === 'OPTIONS'
+      && (requestUrl.pathname === '/api/app-config' || requestUrl.pathname.startsWith(`${config.proxyBasePath}/`))
+    ) {
+      const headers = new Headers()
+      applyCorsHeaders(headers, request)
+      return new Response(null, { status: 204, headers })
+    }
+
+    if (requestUrl.pathname === '/api/app-config') {
+      return json(publicRuntimeConfig(config), 200, request)
+    }
+
+    if (requestUrl.pathname === `${config.proxyBasePath}/remote-image`) {
+      return proxyRemoteImage(requestUrl, request)
+    }
+
+    if (requestUrl.pathname.startsWith(`${config.proxyBasePath}/`)) {
+      return proxyUpstream(request, requestUrl, config)
+    }
+
+    return serveStatic(requestUrl)
+  } catch (error) {
+    return json({ error: { message: `Unhandled app error: ${error.message || String(error)}` } }, 500, request)
   }
-
-  if (requestUrl.pathname === '/api/app-config') {
-    return json(publicRuntimeConfig(config), 200, request)
-  }
-
-  if (requestUrl.pathname === `${config.proxyBasePath}/remote-image`) {
-    return proxyRemoteImage(requestUrl, request)
-  }
-
-  if (requestUrl.pathname.startsWith(`${config.proxyBasePath}/`)) {
-    return proxyUpstream(request, requestUrl, config)
-  }
-
-  return serveStatic(requestUrl)
 })
