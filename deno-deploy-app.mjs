@@ -12,8 +12,7 @@ const DEFAULTS = {
 
 const DIST_DIR = new URL('./dist/', import.meta.url)
 const JOB_TTL_MS = 30 * 60 * 1000
-const JOB_LIMIT = 100
-const jobs = new Map()
+const kv = await Deno.openKv()
 
 const MIME_TYPES = {
   '.css': 'text/css; charset=utf-8',
@@ -199,25 +198,17 @@ function createJob(mode) {
   }
 }
 
-function cleanupJobs() {
-  const now = Date.now()
-  for (const [jobId, job] of jobs.entries()) {
-    if (job.done && now - job.updatedAt > JOB_TTL_MS) {
-      jobs.delete(jobId)
-    }
-  }
+function jobStorageKey(jobId) {
+  return ['jobs', jobId]
+}
 
-  if (jobs.size <= JOB_LIMIT) {
-    return
-  }
+async function saveJob(job) {
+  await kv.set(jobStorageKey(job.id), job, { expireIn: JOB_TTL_MS })
+}
 
-  const ordered = [...jobs.values()].sort((left, right) => left.updatedAt - right.updatedAt)
-  for (const job of ordered) {
-    if (jobs.size <= JOB_LIMIT) {
-      break
-    }
-    jobs.delete(job.id)
-  }
+async function loadJob(jobId) {
+  const entry = await kv.get(jobStorageKey(jobId))
+  return entry.value
 }
 
 function jobSnapshot(job) {
@@ -292,13 +283,11 @@ async function fetchUpstreamJson({
 }
 
 function scheduleJob(job, runner) {
-  jobs.set(job.id, job)
-  cleanupJobs()
-
   queueMicrotask(async () => {
     job.phase = 'requesting'
     job.startedAt = Date.now()
     job.updatedAt = job.startedAt
+    await saveJob(job)
 
     try {
       const result = await runner()
@@ -313,15 +302,16 @@ function scheduleJob(job, runner) {
       job.done = true
       job.completedAt = Date.now()
       job.updatedAt = job.completedAt
-      cleanupJobs()
+      await saveJob(job)
     }
   })
 }
 
-async function startJob(request, config, requestUrl, mode, upstreamPath) {
+async function startJob(request, config, mode, upstreamPath) {
   const contentType = request.headers.get('content-type') || ''
   const body = await readRequestBody(request)
   const job = createJob(mode)
+  await saveJob(job)
 
   scheduleJob(job, async () => {
     return await fetchUpstreamJson({
@@ -365,7 +355,6 @@ Deno.serve(async (request) => {
   try {
     const requestUrl = new URL(request.url)
     const config = getConfig()
-    cleanupJobs()
 
     if (
       request.method === 'OPTIONS'
@@ -387,19 +376,20 @@ Deno.serve(async (request) => {
     }
 
     if (requestUrl.pathname === '/api/generate' && request.method === 'POST') {
-      return startJob(request, config, requestUrl, 'generate', config.generationEndpoint)
+      return startJob(request, config, 'generate', config.generationEndpoint)
     }
 
     if (requestUrl.pathname === '/api/edit' && request.method === 'POST') {
-      return startJob(request, config, requestUrl, 'edit', config.editEndpoint)
+      return startJob(request, config, 'edit', config.editEndpoint)
     }
 
     if (requestUrl.pathname === '/api/progress') {
       const jobId = requestUrl.searchParams.get('id') || ''
-      if (!jobId || !jobs.has(jobId)) {
+      const job = jobId ? await loadJob(jobId) : null
+      if (!job) {
         return json({ ok: false, error: { message: 'Job not found.' } }, 404, request)
       }
-      return json(jobSnapshot(jobs.get(jobId)), 200, request)
+      return json(jobSnapshot(job), 200, request)
     }
 
     if (requestUrl.pathname === `${config.proxyBasePath}/remote-image`) {
