@@ -55,6 +55,7 @@ const state = {
   runtimeProxy: false,
   runtimeConfig: null,
   toastTimer: null,
+  activeJobId: '',
 }
 
 const app = document.querySelector('#app')
@@ -657,6 +658,28 @@ function currentRootUrl() {
   return state.settings.proxyUrl.trim() || state.settings.baseUrl.trim()
 }
 
+function usesAsyncJobMode() {
+  return state.runtimeProxy && Boolean(state.runtimeConfig?.asyncJobs)
+}
+
+function getJobPath(kind) {
+  return kind === 'edit'
+    ? (state.runtimeConfig?.jobEditPath || '/api/edit')
+    : (state.runtimeConfig?.jobGeneratePath || '/api/generate')
+}
+
+function getProgressPath(jobId) {
+  const target = new URL(state.runtimeConfig?.jobProgressPath || '/api/progress', window.location.origin)
+  target.searchParams.set('id', jobId)
+  return target.toString()
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
 function resolveResourceUrl(rawUrl) {
   const value = String(rawUrl || '').trim()
   if (!value || value.startsWith('data:') || value.startsWith('blob:')) {
@@ -714,6 +737,62 @@ async function parseResponseData(response) {
     throw new Error(message)
   }
   return data
+}
+
+function applyAsyncJobSnapshot(snapshot) {
+  const elapsed = Number(snapshot?.elapsed_seconds || 0)
+  if (snapshot?.phase === 'failed') {
+    setStatus('Generation failed', snapshot?.error || 'Request failed')
+    return
+  }
+  if (snapshot?.done) {
+    setStatus('Generation complete', `Waited ${elapsed}s`)
+    return
+  }
+  setStatus('Generating', `Waited ${elapsed}s`)
+}
+
+async function submitAsyncJob(kind, body, headers = {}) {
+  let response
+  try {
+    response = await fetch(getJobPath(kind), {
+      method: 'POST',
+      headers,
+      body,
+    })
+  } catch (error) {
+    throw new Error(error.message || String(error))
+  }
+  const data = await parseResponseData(response)
+  const jobId = data?.job_id || data?.request_id || data?.id
+  if (!jobId) {
+    throw new Error('No job id returned by server.')
+  }
+  state.activeJobId = jobId
+  return jobId
+}
+
+async function pollAsyncJob(jobId) {
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    let response
+    try {
+      response = await fetch(getProgressPath(jobId), {
+        cache: 'no-store',
+      })
+    } catch (error) {
+      throw new Error(error.message || String(error))
+    }
+    const data = await parseResponseData(response)
+    applyAsyncJobSnapshot(data)
+    if (data?.done) {
+      if (!data?.success) {
+        throw new Error(data?.error || 'Generation failed')
+      }
+      return data?.result || data
+    }
+    await sleep(1500)
+  }
+  throw new Error('Generation timed out. Please try again.')
 }
 
 async function requestModelList() {
@@ -776,6 +855,20 @@ function buildGeneratePayload() {
 }
 
 async function runSingleGeneration() {
+  if (usesAsyncJobMode()) {
+    const jobId = await submitAsyncJob(
+      'generate',
+      JSON.stringify(buildGeneratePayload()),
+      { 'Content-Type': 'application/json' },
+    )
+    const data = await pollAsyncJob(jobId)
+    const images = extractImagesFromResponse(data)
+    if (!images.length) {
+      throw new Error('The job completed but returned no image data.')
+    }
+    return images
+  }
+
   const url = joinUrl(currentRootUrl(), state.settings.generationEndpoint)
   let response
   try {
@@ -810,6 +903,16 @@ async function runSingleEdit() {
   form.append('quality', state.settings.quality || 'high')
   form.append('response_format', state.settings.responseFormat || 'b64_json')
   form.append('image', new File([dataUrlToBlob(source.dataUrl)], source.name, { type: source.mime }))
+
+  if (usesAsyncJobMode()) {
+    const jobId = await submitAsyncJob('edit', form)
+    const data = await pollAsyncJob(jobId)
+    const images = extractImagesFromResponse(data)
+    if (!images.length) {
+      throw new Error('The edit job completed but returned no image data.')
+    }
+    return images
+  }
 
   const url = joinUrl(currentRootUrl(), state.settings.editEndpoint)
   let response
@@ -846,6 +949,7 @@ async function generateImages() {
   }
 
   setBusy(true)
+  state.activeJobId = ''
   setStatus('正在生成', '模型正在雕刻画面，请稍候。')
 
   try {

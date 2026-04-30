@@ -11,6 +11,9 @@ const DEFAULTS = {
 }
 
 const DIST_DIR = new URL('./dist/', import.meta.url)
+const JOB_TTL_MS = 30 * 60 * 1000
+const JOB_LIMIT = 100
+const jobs = new Map()
 
 const MIME_TYPES = {
   '.css': 'text/css; charset=utf-8',
@@ -123,6 +126,10 @@ function publicRuntimeConfig(config) {
     responseFormat: config.responseFormat,
     quality: config.quality,
     background: config.background,
+    asyncJobs: true,
+    jobGeneratePath: '/api/generate',
+    jobEditPath: '/api/edit',
+    jobProgressPath: '/api/progress',
   }
 }
 
@@ -174,74 +181,201 @@ async function readRequestBody(request) {
   return new Uint8Array(await request.arrayBuffer())
 }
 
-async function proxyUpstream(request, requestUrl, config) {
+function createJob(mode) {
+  const id = crypto.randomUUID()
+  const now = Date.now()
+  return {
+    id,
+    mode,
+    phase: 'queued',
+    done: false,
+    success: false,
+    createdAt: now,
+    updatedAt: now,
+    startedAt: 0,
+    completedAt: 0,
+    error: null,
+    result: null,
+  }
+}
+
+function cleanupJobs() {
+  const now = Date.now()
+  for (const [jobId, job] of jobs.entries()) {
+    if (job.done && now - job.updatedAt > JOB_TTL_MS) {
+      jobs.delete(jobId)
+    }
+  }
+
+  if (jobs.size <= JOB_LIMIT) {
+    return
+  }
+
+  const ordered = [...jobs.values()].sort((left, right) => left.updatedAt - right.updatedAt)
+  for (const job of ordered) {
+    if (jobs.size <= JOB_LIMIT) {
+      break
+    }
+    jobs.delete(job.id)
+  }
+}
+
+function jobSnapshot(job) {
+  const end = job.done ? (job.completedAt || job.updatedAt) : Date.now()
+  const start = job.startedAt || job.createdAt
+  return {
+    ok: true,
+    id: job.id,
+    request_id: job.id,
+    phase: job.phase,
+    done: job.done,
+    success: job.success,
+    elapsed_seconds: Math.max(0, Math.floor((end - start) / 1000)),
+    requested_count: 1,
+    completed_count: job.success ? 1 : 0,
+    error: job.error,
+    result: job.result,
+    output: job.result?.data?.[0]?.url || null,
+  }
+}
+
+async function fetchUpstreamJson({
+  config,
+  request,
+  upstreamPath,
+  method,
+  body,
+  contentType,
+}) {
   if (!config.upstreamApiKey) {
-    return json({ error: { message: 'Missing UPSTREAM_API_KEY.' } }, 500, request)
+    throw new Error('Missing UPSTREAM_API_KEY.')
   }
 
   const upstreamBaseUrl = trimTrailingSlash(config.upstreamBaseUrl)
-  const upstreamPath = requestUrl.pathname.slice(config.proxyBasePath.length) + requestUrl.search
   const upstreamUrl = `${upstreamBaseUrl}${upstreamPath}`
 
   const headers = new Headers()
-  const contentType = request.headers.get('content-type')
   if (contentType) {
     headers.set('Content-Type', contentType)
   }
   headers.set('Accept', 'application/json, */*')
   headers.set('Authorization', `Bearer ${config.upstreamApiKey}`)
 
-  let requestBody
-  try {
-    requestBody = await readRequestBody(request)
-  } catch (error) {
-    return json({ error: { message: `Failed to read request body: ${error.message || String(error)}` } }, 400, request)
-  }
-
-  let upstreamResponse
-  try {
-    upstreamResponse = await fetch(upstreamUrl, {
-      method: request.method,
-      headers,
-      body: requestBody,
-    })
-  } catch (error) {
-    return json({ error: { message: `Upstream proxy request failed: ${error.message || String(error)}` } }, 502, request)
-  }
+  const upstreamResponse = await fetch(upstreamUrl, {
+    method,
+    headers,
+    body,
+  })
 
   const contentTypeHeader = upstreamResponse.headers.get('content-type') || ''
-  if (contentTypeHeader.includes('application/json')) {
-    let payload
-    try {
-      payload = await upstreamResponse.json()
-    } catch {
-      return json({ error: { message: 'Upstream returned invalid JSON.' } }, 502, request)
-    }
-
-    if (Array.isArray(payload?.data)) {
-      payload.data = payload.data.map((item) => rewriteImageUrls(item, request, config))
-    }
-
-    return json(payload, upstreamResponse.status, request)
+  if (!contentTypeHeader.includes('application/json')) {
+    throw new Error(`Upstream returned non-JSON content, HTTP ${upstreamResponse.status}.`)
   }
 
-  const headersOut = new Headers(upstreamResponse.headers)
-  headersOut.set('Cache-Control', 'no-store')
-  applyCorsHeaders(headersOut, request)
-  return new Response(upstreamResponse.body, {
-    status: upstreamResponse.status,
-    headers: headersOut,
+  let payload
+  try {
+    payload = await upstreamResponse.json()
+  } catch {
+    throw new Error('Upstream returned invalid JSON.')
+  }
+
+  if (!upstreamResponse.ok) {
+    const message = payload?.error?.message || payload?.message || payload?.detail || `Request failed, HTTP ${upstreamResponse.status}`
+    throw new Error(message)
+  }
+
+  if (Array.isArray(payload?.data)) {
+    payload.data = payload.data.map((item) => rewriteImageUrls(item, request, config))
+  }
+
+  return payload
+}
+
+function scheduleJob(job, runner) {
+  jobs.set(job.id, job)
+  cleanupJobs()
+
+  queueMicrotask(async () => {
+    job.phase = 'requesting'
+    job.startedAt = Date.now()
+    job.updatedAt = job.startedAt
+
+    try {
+      const result = await runner()
+      job.result = result
+      job.success = true
+      job.phase = 'completed'
+    } catch (error) {
+      job.success = false
+      job.phase = 'failed'
+      job.error = error?.message || String(error)
+    } finally {
+      job.done = true
+      job.completedAt = Date.now()
+      job.updatedAt = job.completedAt
+      cleanupJobs()
+    }
   })
+}
+
+async function startJob(request, config, requestUrl, mode, upstreamPath) {
+  const contentType = request.headers.get('content-type') || ''
+  const body = await readRequestBody(request)
+  const job = createJob(mode)
+
+  scheduleJob(job, async () => {
+    return await fetchUpstreamJson({
+      config,
+      request,
+      upstreamPath,
+      method: 'POST',
+      body,
+      contentType,
+    })
+  })
+
+  return json({
+    ok: true,
+    job_id: job.id,
+    request_id: job.id,
+    phase: job.phase,
+  }, 202, request)
+}
+
+async function proxyUpstream(request, requestUrl, config) {
+  try {
+    const body = await readRequestBody(request)
+    const payload = await fetchUpstreamJson({
+      config,
+      request,
+      upstreamPath: requestUrl.pathname.slice(config.proxyBasePath.length) + requestUrl.search,
+      method: request.method,
+      body,
+      contentType: request.headers.get('content-type') || '',
+    })
+    return json(payload, 200, request)
+  } catch (error) {
+    const message = error?.message || String(error)
+    const status = message.startsWith('Missing UPSTREAM_API_KEY') ? 500 : 502
+    return json({ error: { message } }, status, request)
+  }
 }
 
 Deno.serve(async (request) => {
   try {
     const requestUrl = new URL(request.url)
     const config = getConfig()
+    cleanupJobs()
 
     if (
       request.method === 'OPTIONS'
-      && (requestUrl.pathname === '/api/app-config' || requestUrl.pathname.startsWith(`${config.proxyBasePath}/`))
+      && (
+        requestUrl.pathname === '/api/app-config'
+        || requestUrl.pathname === '/api/generate'
+        || requestUrl.pathname === '/api/edit'
+        || requestUrl.pathname === '/api/progress'
+        || requestUrl.pathname.startsWith(`${config.proxyBasePath}/`)
+      )
     ) {
       const headers = new Headers()
       applyCorsHeaders(headers, request)
@@ -250,6 +384,22 @@ Deno.serve(async (request) => {
 
     if (requestUrl.pathname === '/api/app-config') {
       return json(publicRuntimeConfig(config), 200, request)
+    }
+
+    if (requestUrl.pathname === '/api/generate' && request.method === 'POST') {
+      return startJob(request, config, requestUrl, 'generate', config.generationEndpoint)
+    }
+
+    if (requestUrl.pathname === '/api/edit' && request.method === 'POST') {
+      return startJob(request, config, requestUrl, 'edit', config.editEndpoint)
+    }
+
+    if (requestUrl.pathname === '/api/progress') {
+      const jobId = requestUrl.searchParams.get('id') || ''
+      if (!jobId || !jobs.has(jobId)) {
+        return json({ ok: false, error: { message: 'Job not found.' } }, 404, request)
+      }
+      return json(jobSnapshot(jobs.get(jobId)), 200, request)
     }
 
     if (requestUrl.pathname === `${config.proxyBasePath}/remote-image`) {
